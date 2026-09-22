@@ -1,8 +1,24 @@
-const CHECK_INTERVAL = 30 * 1000;
+const RECENT_POSTS_LIMIT = 50;
+const TIMELINE_PATTERN = /^\/i\/timeline/;
 
-let lastSeenPostId = null;
 let initialized = false;
 let checkInProgress = false;
+
+async function loadState() {
+  const data = await chrome.storage.local.get([
+    "lastSeenPostId",
+    "recentPostIds"
+  ]);
+
+  if (data.lastSeenPostId) {
+    initialized = true;
+  }
+
+  return {
+    lastSeenPostId: data.lastSeenPostId || null,
+    recentPostIds: data.recentPostIds || []
+  };
+}
 
 function getTimelinePosts() {
   const articles = document.querySelectorAll('article');
@@ -10,21 +26,28 @@ function getTimelinePosts() {
   const posts = [];
 
   for (const article of articles) {
-    const links = article.querySelectorAll('a[href*="/status/"]');
+    const links = article.querySelectorAll(
+      'a[href*="/status/"]'
+    );
 
     for (const link of links) {
-      const match = link.href.match(/\/status\/(\d+)/);
+      const match =
+        link.href.match(/\/status\/(\d+)/);
 
-      if (match) {
-        const postId = match[1];
+      if (!match) {
+        continue;
+      }
 
-        if (!posts.some(post => post.id === postId)) {
-          posts.push({
-            id: postId,
-            url: link.href,
-            element: article
-          });
-        }
+      const id = match[1];
+
+      if (
+        !posts.some(post => post.id === id)
+      ) {
+        posts.push({
+          id,
+          url: link.href,
+          element: article
+        });
       }
     }
   }
@@ -34,34 +57,25 @@ function getTimelinePosts() {
 
 function getNewestPost() {
   const posts = getTimelinePosts();
-
-  if (posts.length === 0) {
+  if (!posts.length) {
     return null;
   }
 
-  // X timeline is normally newest first.
-  // We still compare numeric IDs to avoid relying entirely on DOM order.
-  posts.sort((a, b) => {
-    try {
-      return BigInt(b.id) > BigInt(a.id) ? 1 : -1;
-    } catch {
-      return 0;
-    }
-  });
-
+  // The timeline normally places the newest post first.
   return posts[0];
 }
 
-function extractPostText(post) {
+function getPostText(post) {
   if (!post?.element) {
     return "";
   }
 
-  const textElement = post.element.querySelector(
-    '[data-testid="tweetText"]'
-  );
+  const text =
+    post.element.querySelector(
+      '[data-testid="tweetText"]'
+    );
 
-  return textElement?.innerText?.trim() || "";
+  return text?.innerText?.trim() || "";
 }
 
 async function checkTimeline() {
@@ -72,116 +86,134 @@ async function checkTimeline() {
   checkInProgress = true;
 
   try {
+    const state = await loadState();
+
     const newestPost = getNewestPost();
 
     if (!newestPost) {
-      console.log("[X Watcher] No posts found.");
+      console.log(
+        "[X Watcher] No timeline posts found."
+      );
       return;
     }
 
     console.log(
-      "[X Watcher] Newest post:",
+      "[X Watcher] Current newest:",
       newestPost.id
     );
 
-    // First scan establishes the baseline.
+    // First-ever scan establishes baseline.
     if (!initialized) {
-      lastSeenPostId = newestPost.id;
-      initialized = true;
-
       await chrome.storage.local.set({
-        lastSeenPostId
+        lastSeenPostId: newestPost.id,
+        recentPostIds: [newestPost.id]
       });
 
+      initialized = true;
+
       console.log(
-        "[X Watcher] Baseline established:",
-        lastSeenPostId
+        "[X Watcher] Baseline:",
+        newestPost.id
       );
 
       return;
     }
 
-    if (newestPost.id === lastSeenPostId) {
+    // Anything we've seen recently is not new,
+    // no matter where X places it in the DOM.
+    if (state.recentPostIds.includes(newestPost.id)) {
+      if (newestPost.id !== state.lastSeenPostId) {
+        // Newest visible post changed to something we
+        // already know; keep lastSeenPostId tracking it
+        // so the cache cursor follows the top of the feed.
+        await chrome.storage.local.set({
+          lastSeenPostId: newestPost.id
+        });
+      }
       return;
     }
 
-    let isNewer = false;
-
+    // Unknown id older than the cursor: promoted content,
+    // replies, or junk X inserted at the top. Not new.
+    let isNewer = true;
     try {
       isNewer =
-        BigInt(newestPost.id) > BigInt(lastSeenPostId);
+        BigInt(newestPost.id) > BigInt(state.lastSeenPostId);
     } catch {
-      isNewer = newestPost.id !== lastSeenPostId;
+      isNewer = true;
     }
 
     if (!isNewer) {
       return;
     }
 
-    console.log(
-      "[X Watcher] NEW POST:",
-      newestPost.id
-    );
-
     lastSeenPostId = newestPost.id;
 
     await chrome.storage.local.set({
-      lastSeenPostId
+      lastSeenPostId,
+      recentPostIds: [
+        newestPost.id,
+        ...state.recentPostIds
+      ].slice(0, RECENT_POSTS_LIMIT)
     });
 
-    const text = extractPostText(newestPost);
+    const post = {
+      id: newestPost.id,
+      url: newestPost.url,
+      text: getPostText(newestPost)
+    };
 
     chrome.runtime.sendMessage({
       type: "NEW_POST",
-      post: {
-        id: newestPost.id,
-        url: newestPost.url,
-        text
-      }
+      post
     });
   } finally {
     checkInProgress = false;
   }
 }
 
-function startWatcher() {
-  console.log("[X Watcher] Starting...");
-
-  checkTimeline();
-
-  setInterval(() => {
-    checkTimeline();
-  }, CHECK_INTERVAL);
-}
-
-// X is a SPA, so the timeline can change without the page itself loading.
-const observer = new MutationObserver(() => {
-  // Don't immediately alert from every DOM mutation.
-  // The 30-second poll remains our actual detection mechanism.
-});
-
-observer.observe(document.documentElement, {
-  childList: true,
-  subtree: true
-});
-
-startWatcher();
-
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type !== "PLAY_ALERT") {
-    return;
-  }
+function playAlert() {
 
   const audio = new Audio(
-    chrome.runtime.getURL("sounds/alert.mp3")
+    chrome.runtime.getURL(
+      "sounds/alert.mp3"
+    )
   );
 
   audio.volume = 1.0;
 
-  audio.play().catch((error) => {
+  audio.play().catch(error => {
     console.warn(
-      "[X Watcher] Could not play alert sound:",
+      "[X Watcher] Audio playback blocked:",
       error
     );
   });
-});
+}
+
+function isTimelinePath() {
+  return TIMELINE_PATTERN.test(location.pathname);
+}
+
+// X is a SPA: navigating away unloads us anyway,
+// but re-entering /i/timeline must be able to
+// re-register the message listener if Chrome
+// keeps the content script alive.
+if (!isTimelinePath()) {
+  console.log(
+    "[X Watcher] Not on /i/timeline — ignoring."
+  );
+} else {
+  chrome.runtime.onMessage.addListener(
+    (message) => {
+      if (message.type === "CHECK_TIMELINE") {
+        checkTimeline();
+      }
+
+      if (message.type === "PLAY_ALERT") {
+        playAlert();
+      }
+    }
+  );
+
+  loadState();
+}

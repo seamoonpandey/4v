@@ -1,6 +1,7 @@
-// Minimal smoke test: loads content.js's pure logic with DOM/chrome stubs.
-// Verifies baseline, newer-post detection, no regression to old posts,
-// and duplicate-alert suppression. Run: node test/smoke.test.js
+// V2 smoke tests: stub DOM/chrome, drive CHECK_TIMELINE manually.
+// Covers cache-based detection, promoted posts, scroll-back,
+// reload persistence, cache cap, re-entrancy, SPA navigation.
+// Run: node test/smoke.test.js
 
 const assert = require("assert");
 
@@ -32,21 +33,25 @@ global.MutationObserver = class {
   observe() {}
 };
 
-// Capture the poll callback instead of waiting 30 real seconds.
-let intervalCallback = null;
+// Track intervals without scheduling real timers.
+const intervals = [];
 global.setInterval = (fn) => {
-  intervalCallback = fn;
-  return 0;
+  intervals.push(fn);
+  return intervals.length;
 };
 
 // --- Stub chrome ---
 const sentMessages = [];
-const storageState = {};
+const listeners = [];
+let storageState = {};
+let audioPlays = 0;
 
 global.chrome = {
   storage: {
     local: {
-      set: async (obj) => Object.assign(storageState, obj),
+      set: async (obj) => {
+        storageState = { ...storageState, ...obj };
+      },
       get: async (keys) =>
         keys.reduce(
           (acc, key) => (acc[key] = storageState[key], acc),
@@ -55,52 +60,149 @@ global.chrome = {
     }
   },
   runtime: {
-    onMessage: { addListener: () => {} },
+    onMessage: {
+      addListener: (fn) => listeners.push(fn)
+    },
     sendMessage: (msg) => sentMessages.push(msg),
     getURL: (p) => `chrome-extension://fake/${p}`
   }
 };
 
-require("../content.js");
+global.Audio = class {
+  play() {
+    audioPlays += 1;
+    return Promise.resolve();
+  }
+};
 
-// Run one poll cycle and let its async body settle.
-async function tick(ms = 50) {
-  intervalCallback();
+function dispatch(message) {
+  for (const fn of listeners) fn(message);
+}
+
+// Run one check cycle and let its async body settle.
+async function tick(ms = 30) {
+  dispatch({ type: "CHECK_TIMELINE" });
   await new Promise(r => setTimeout(r, ms));
 }
 
+function resetTestScope() {
+  // Fresh module registry so each suite reloads content.js
+  // with clean module-level state.
+  delete require.cache[
+    require.resolve("../content.js")
+  ];
+  sentMessages.length = 0;
+  listeners.length = 0;
+  storageState = {};
+  audioPlays = 0;
+}
+
+function requireContent(pathname) {
+  global.location = { pathname };
+  require("../content.js");
+}
+
+function lastAlert() {
+  return sentMessages[sentMessages.length - 1];
+}
+
 (async () => {
-  // 1. Baseline: first scan must NOT alert.
+  // --- Suite 1: core detection ---
+  requireContent("/i/timeline");
+  await tick(); // let loadState settle
   setPosts(["100"]);
-  await tick();
+
+  await tick(); // baseline
   assert.strictEqual(storageState.lastSeenPostId, "100");
+  assert.deepStrictEqual(storageState.recentPostIds, ["100"]);
   assert.strictEqual(sentMessages.length, 0, "baseline must not alert");
   console.log("ok - baseline established without alert");
 
-  // 2. Same post again: still no alert.
-  await tick();
-  assert.strictEqual(sentMessages.length, 0, "same post must not re-alert");
+  await tick(); // same post: silence
+  assert.strictEqual(sentMessages.length, 0);
   console.log("ok - no duplicate alert for same post");
 
-  // 3. Newer post arrives: exactly one alert.
-  setPosts(["200", "100"]);
+  // promoted post at top (older snowflake, as real promoted
+  // content is): filtered, cursor and cache untouched
+  setPosts(["50", "100"]);
   await tick();
-  assert.strictEqual(sentMessages.length, 1, "newer post must alert");
-  assert.strictEqual(sentMessages[0].type, "NEW_POST");
-  assert.strictEqual(sentMessages[0].post.id, "200");
-  console.log("ok - newer post alerts once");
+  assert.strictEqual(sentMessages.length, 0, "promoted post must not alert");
+  assert.strictEqual(storageState.lastSeenPostId, "100",
+    "cursor must not advance to promoted content");
+  assert.deepStrictEqual(storageState.recentPostIds, ["100"],
+    "cache must not grow for promoted content");
+  console.log("ok - promoted (older) post at top is ignored");
 
-  // 4. Regression to an older post alone: must NOT alert.
-  setPosts(["150"]);
-  await tick();
-  assert.strictEqual(sentMessages.length, 1, "older post must not alert");
-  console.log("ok - older post does not trigger alert");
-
-  // 5. Empty timeline: no crash, no alert.
-  setPosts([]);
+  // genuine new post
+  setPosts(["900", "100"]);
   await tick();
   assert.strictEqual(sentMessages.length, 1);
-  console.log("ok - empty timeline is a no-op");
+  assert.strictEqual(lastAlert().post.id, "900");
+  assert.deepStrictEqual(storageState.recentPostIds, ["900", "100"]);
+  console.log("ok - new post alerts once and is cached");
+
+  // scroll-back: 100 returns to top after cache cursor moved
+  setPosts(["100"]);
+  await tick();
+  assert.strictEqual(sentMessages.length, 1, "scroll-back must not re-alert");
+  console.log("ok - scroll-back to older post does not re-alert");
+
+  // PLAY_ALERT triggers audio playback
+  dispatch({ type: "PLAY_ALERT" });
+  await new Promise(r => setTimeout(r, 20));
+  assert.strictEqual(audioPlays, 1, "PLAY_ALERT must play sound once");
+  console.log("ok - PLAY_ALERT plays audio");
+
+  // --- Suite 2: reload persistence (extension reload / browser restart) ---
+  resetTestScope();
+  setPosts(["100"]); // DOM restored, storage survives
+  requireContent("/i/timeline");
+  await tick(); // loadState settles; initialized=true from storage
+
+  setPosts(["950"]);
+  await tick();
+  assert.strictEqual(sentMessages.length, 1, "unseen post after reload must alert");
+  assert.strictEqual(lastAlert().post.id, "950");
+  console.log("ok - cache persists across content-script reload");
+
+  // --- Suite 3: cache cap ---
+  resetTestScope();
+  setPosts(["100"]);
+  requireContent("/i/timeline");
+  await tick(); // baseline
+  for (let i = 200; i <= 680; i += 10) {
+    setPosts([String(i), "100"]);
+    await tick();
+  }
+  assert.strictEqual(storageState.recentPostIds.length, 50,
+    "cache must be capped at 50");
+  assert.strictEqual(storageState.recentPostIds[0], "680",
+    "newest id stays at front of cache");
+  console.log("ok - recent-post cache capped at 50 entries");
+
+  // --- Suite 4: re-entrancy guard ---
+  resetTestScope();
+  setPosts(["100"]);
+  requireContent("/i/timeline");
+  await tick(); // baseline
+  setPosts(["300"]);
+  // Two overlapping ticks share one 30ms settle window.
+  dispatch({ type: "CHECK_TIMELINE" });
+  dispatch({ type: "CHECK_TIMELINE" });
+  await new Promise(r => setTimeout(r, 60));
+  assert.strictEqual(sentMessages.length, 1,
+    "overlapping checks must alert exactly once");
+  console.log("ok - overlapping checks alert exactly once");
+
+  // --- Suite 5: SPA navigation guard ---
+  resetTestScope();
+  requireContent("/home"); // wrong page
+  assert.strictEqual(listeners.length, 0,
+    "must not register listeners off the timeline");
+  dispatch({ type: "CHECK_TIMELINE" });
+  await new Promise(r => setTimeout(r, 30));
+  assert.strictEqual(sentMessages.length, 0);
+  console.log("ok - listeners not registered off /i/timeline");
 
   console.log("\nAll smoke tests passed.");
   process.exit(0);
