@@ -55,16 +55,6 @@ function getTimelinePosts() {
   return posts;
 }
 
-function getNewestPost() {
-  const posts = getTimelinePosts();
-  if (!posts.length) {
-    return null;
-  }
-
-  // The timeline normally places the newest post first.
-  return posts[0];
-}
-
 function getPostText(post) {
   if (!post?.element) {
     return "";
@@ -78,6 +68,21 @@ function getPostText(post) {
   return text?.innerText?.trim() || "";
 }
 
+function isNewerThanCursor(id, cursorId) {
+  try {
+    return BigInt(id) > BigInt(cursorId);
+  } catch {
+    return true;
+  }
+}
+
+function emitNewPost(post) {
+  chrome.runtime.sendMessage({
+    type: "NEW_POST",
+    post
+  });
+}
+
 async function checkTimeline() {
   if (checkInProgress) {
     return;
@@ -88,9 +93,9 @@ async function checkTimeline() {
   try {
     const state = await loadState();
 
-    const newestPost = getNewestPost();
+    const posts = getTimelinePosts();
 
-    if (!newestPost) {
+    if (!posts.length) {
       console.log(
         "[X Watcher] No timeline posts found."
       );
@@ -99,74 +104,81 @@ async function checkTimeline() {
 
     console.log(
       "[X Watcher] Current newest:",
-      newestPost.id
+      posts[0].id
     );
 
-    // First-ever scan establishes baseline.
+    // First-ever scan establishes the baseline:
+    // everything currently visible counts as seen.
     if (!initialized) {
       await chrome.storage.local.set({
-        lastSeenPostId: newestPost.id,
-        recentPostIds: [newestPost.id]
+        lastSeenPostId: posts[0].id,
+        recentPostIds: posts
+          .map(post => post.id)
+          .slice(0, RECENT_POSTS_LIMIT)
       });
 
       initialized = true;
 
       console.log(
         "[X Watcher] Baseline:",
-        newestPost.id
+        posts[0].id
       );
 
       return;
     }
 
-    // Anything we've seen recently is not new,
-    // no matter where X places it in the DOM.
-    if (state.recentPostIds.includes(newestPost.id)) {
-      if (newestPost.id !== state.lastSeenPostId) {
-        // Newest visible post changed to something we
-        // already know; keep lastSeenPostId tracking it
-        // so the cache cursor follows the top of the feed.
+    // Collect everything genuinely new: not in the
+    // cache and newer than the cursor. Promoted
+    // content, replies, and junk X inserts at the top
+    // are older snowflakes, so they never qualify.
+    const newPosts = posts.filter(post =>
+      !state.recentPostIds.includes(post.id) &&
+      isNewerThanCursor(post.id, state.lastSeenPostId)
+    );
+
+    if (!newPosts.length) {
+      // Newest visible post changed to something we
+      // already know; keep the cursor following the
+      // top of the feed. Only cached ids count, so a
+      // promoted post at the top never captures it.
+      if (
+        state.recentPostIds.includes(posts[0].id) &&
+        posts[0].id !== state.lastSeenPostId
+      ) {
         await chrome.storage.local.set({
-          lastSeenPostId: newestPost.id
+          lastSeenPostId: posts[0].id
         });
       }
       return;
     }
 
-    // Unknown id older than the cursor: promoted content,
-    // replies, or junk X inserted at the top. Not new.
-    let isNewer = true;
-    try {
-      isNewer =
-        BigInt(newestPost.id) > BigInt(state.lastSeenPostId);
-    } catch {
-      isNewer = true;
-    }
+    // Alert oldest first so a burst reads in order.
+    newPosts.sort((a, b) =>
+      isNewerThanCursor(a.id, b.id) ? 1 : -1
+    );
 
-    if (!isNewer) {
-      return;
-    }
-
-    lastSeenPostId = newestPost.id;
+    const newestId = newPosts[newPosts.length - 1].id;
 
     await chrome.storage.local.set({
-      lastSeenPostId,
+      lastSeenPostId: newestId,
       recentPostIds: [
-        newestPost.id,
+        ...newPosts.map(post => post.id).reverse(),
         ...state.recentPostIds
       ].slice(0, RECENT_POSTS_LIMIT)
     });
 
-    const post = {
-      id: newestPost.id,
-      url: newestPost.url,
-      text: getPostText(newestPost)
-    };
+    console.log(
+      "[X Watcher] NEW POSTS:",
+      newPosts.map(post => post.id).join(", ")
+    );
 
-    chrome.runtime.sendMessage({
-      type: "NEW_POST",
-      post
-    });
+    for (const post of newPosts) {
+      emitNewPost({
+        id: post.id,
+        url: post.url,
+        text: getPostText(post)
+      });
+    }
   } finally {
     checkInProgress = false;
   }

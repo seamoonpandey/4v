@@ -1,10 +1,19 @@
 async function loadState() {
   const data = await chrome.storage.local.get([
-    "lastSeenPostId"
+    "lastSeenPostId",
+    "recentPostIds"
   ]);
 
   document.getElementById("lastPost").textContent =
     data.lastSeenPostId || "None";
+
+  const ids = data.recentPostIds || [];
+
+  document.getElementById("cacheCount").textContent =
+    `${ids.length} posts`;
+
+  document.getElementById("cacheList").textContent =
+    ids.join("\n") || "empty";
 }
 
 document

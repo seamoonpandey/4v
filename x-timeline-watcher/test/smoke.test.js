@@ -204,6 +204,48 @@ function lastAlert() {
   assert.strictEqual(sentMessages.length, 0);
   console.log("ok - listeners not registered off /i/timeline");
 
+  // --- Suite 6: bursts ---
+  resetTestScope();
+  setPosts([]); // clear DOM stub left over from suite 4
+  requireContent("/i/timeline");
+  await tick();
+
+  // Baseline caches every visible post, not just the newest.
+  setPosts(["100", "90", "80"]);
+  await tick();
+  assert.deepStrictEqual(storageState.recentPostIds,
+    ["100", "90", "80"],
+    "baseline must cache all visible posts");
+  assert.strictEqual(sentMessages.length, 0);
+  console.log("ok - multi-post baseline caches everything visible");
+
+  // Burst: two genuine new posts plus a promoted older one.
+  setPosts(["120", "110", "50", "100", "90"]);
+  await tick();
+  assert.strictEqual(sentMessages.length, 2,
+    "burst must alert for each new post, excluding promoted");
+  assert.strictEqual(sentMessages[0].post.id, "110",
+    "burst alerts must fire oldest first");
+  assert.strictEqual(sentMessages[1].post.id, "120");
+  assert.deepStrictEqual(storageState.recentPostIds,
+    ["120", "110", "100", "90", "80"]);
+  assert.strictEqual(storageState.lastSeenPostId, "120");
+  console.log("ok - burst alerts every new post oldest-first, promoted excluded");
+
+  // Same DOM again: nothing new.
+  await tick();
+  assert.strictEqual(sentMessages.length, 2,
+    "re-checking the same burst must not re-alert");
+  console.log("ok - repeated check after burst is silent");
+
+  // Follow-up single post on top of the burst.
+  setPosts(["130", "120", "110", "50", "100"]);
+  await tick();
+  assert.strictEqual(sentMessages.length, 3);
+  assert.strictEqual(lastAlert().post.id, "130");
+  assert.strictEqual(storageState.recentPostIds[0], "130");
+  console.log("ok - post arriving after a burst alerts normally");
+
   console.log("\nAll smoke tests passed.");
   process.exit(0);
 })().catch((err) => {
