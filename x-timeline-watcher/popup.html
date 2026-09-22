@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>X Timeline Watcher</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+
+<body>
+
+  <h1>X Timeline Watcher</h1>
+
+  <div class="status">
+    <span id="statusDot"></span>
+    <span id="statusText">Checking...</span>
+  </div>
+
+  <div class="info">
+    <div>Interval</div>
+    <strong>30 seconds</strong>
+  </div>
+
+  <div class="info">
+    <div>Last seen post</div>
+    <strong id="lastPost">None</strong>
+  </div>
+
+  <button id="testSound">
+    Test Alert
+  </button>
+
+  <script src="popup.js"></script>
+
+</body>
+</html>

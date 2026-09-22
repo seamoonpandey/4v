@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "X Timeline Watcher",
+  "version": "0.1.0",
+  "description": "Monitors X timeline for new posts and alerts when one appears.",
+  "permissions": [
+    "notifications",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://x.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://x.com/i/timeline*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "sounds/alert.mp3"
+      ],
+      "matches": [
+        "https://x.com/*"
+      ]
+    }
+  ]
+}
